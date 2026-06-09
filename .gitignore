@@ -1,0 +1,47 @@
+# Python virtual environments
+env/
+venv/
+.venv/
+ENV/
+.env/
+
+# Environment variable files
+.env
+.env.*
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Jupyter artifacts
+.ipynb_checkpoints/
+
+# Quarto cache and build artifacts
+_cache/
+.quarto/
+
+# Large data files
+data/*.csv
+data/*.tsv
+data/*.zip
+data/*.parquet
+data/*.db
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+
+# Editor directories
+.vscode/
+.idea/
+
+# Homework submission artifacts
+*.ipynb
+*.tex
+*.zip
+*.pdf
+tests/
+.jupyter_cache/

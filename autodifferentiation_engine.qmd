@@ -1,0 +1,526 @@
+---
+title: "Autodifferentiation Engine from Scratch"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+    smooth-scroll: true
+    highlight-style: github
+    fig-align: center
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+## Introduction
+
+**This project implements a reverse-mode automatic differentiation library from scratch** — no PyTorch, no TensorFlow, no ML framework of any kind. The only dependency is NumPy.
+
+The library centers on a `BearTensor` abstraction: a wrapper around NumPy arrays that records every arithmetic operation performed on it, building a dynamic computation graph in the forward pass. When `.backward()` is called on a loss node, the engine traverses that graph in reverse topological order and propagates gradients all the way back to every leaf parameter — exactly the mechanism that powers gradient descent in modern deep learning frameworks.
+
+On top of the engine, I implemented three optimizers (SGD, Momentum, Adam) and used the full system to train a two-layer network on the [Wine Quality dataset](https://archive.ics.uci.edu/dataset/186/wine+quality), confirming that loss decreases smoothly across all optimizers. I also implemented **Muon**, a research-grade optimizer that replaces raw momentum with an orthogonalized update via Newton-Schulz iteration — the same method that beat AdamW in the NanoGPT speedrun benchmark.
+
+---
+
+## Setup
+
+```{python}
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+import matplotlib.pyplot as plt
+from collections import deque
+from copy import deepcopy
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(189)
+```
+
+---
+
+## The BearTensor Abstraction
+
+**The core data structure is `BearTensor`**, a thin wrapper around a NumPy array that adds three things: a human-readable name (useful for graph visualization), a list of parent nodes in the computation graph, and an `adjoint` field that accumulates the gradient during the backward pass.
+
+Two supporting dataclasses make this work. `BearGrad` stores a callable `fn` that, given the upstream gradient, computes the gradient to pass downstream — it applies the chain rule at one edge of the graph. `BearParent` pairs a `BearTensor` with its `BearGrad`, so each node knows both *who* its parents are and *how* to send them their gradients.
+
+```{python}
+@dataclass
+class BearGrad:
+    fn: callable
+    op_str: str | None = None
+
+@dataclass
+class BearParent:
+    parent: 'BearTensor'
+    grad: BearGrad
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+class BearTensor:
+    def __init__(self, name: str, value: np.ndarray, parents: list | None = None):
+        self.name = name
+        self.value = value
+        self.parents = parents if parents is not None else []
+        self.adjoint: float | np.ndarray = 0.0
+```
+
+---
+
+## Building the Computation Graph
+
+**Every arithmetic operation on a `BearTensor` returns a new tensor whose parent list records where it came from.** This is operator overloading — Python calls `__add__`, `__mul__`, etc. whenever you write `a + b` on these objects. Each operation simultaneously computes the forward value *and* registers the backward gradient function, capturing the operand values as closures so backprop knows what derivatives to apply later.
+
+This is what makes the graph *dynamic*: it is built anew on every forward pass, so loops and conditionals in the forward code are handled naturally without any special tracing or compilation step.
+
+```{python}
+def __add__(self, other):
+    if self.value.shape != other.value.shape:
+        raise ValueError("Shapes must match")
+    return BearTensor(f"({self.name}+{other.name})", self.value + other.value, [
+        BearParent(self,  BearGrad(lambda g: g)),
+        BearParent(other, BearGrad(lambda g: g)),
+    ])
+
+def __sub__(self, other):
+    if self.value.shape != other.value.shape:
+        raise ValueError("Shapes must match")
+    return BearTensor(f"({self.name}-{other.name})", self.value - other.value, [
+        BearParent(self,  BearGrad(lambda g: g)),
+        BearParent(other, BearGrad(lambda g: -g)),
+    ])
+
+def __mul__(self, other):
+    if self.value.shape != other.value.shape:
+        raise ValueError("Shapes must match")
+    sv, ov = self.value, other.value
+    return BearTensor(f"({self.name}*{other.name})", sv * ov, [
+        BearParent(self,  BearGrad(lambda g: g * ov)),
+        BearParent(other, BearGrad(lambda g: g * sv)),
+    ])
+
+def __pow__(self, power: float):
+    sv = self.value
+    return BearTensor(f"({self.name}**{power})", sv ** power, [
+        BearParent(self, BearGrad(lambda g: g * power * sv ** (power - 1))),
+    ])
+
+def __matmul__(self, other):
+    sv, ov = self.value, other.value
+    s0, s1 = sv.shape, ov.shape
+    result = np.atleast_1d(sv @ ov)
+
+    def grad_sv(g):
+        if ov.ndim == 1:
+            return np.outer(g, ov).reshape(s0)
+        return (np.atleast_2d(g) @ ov.T).reshape(s0)
+
+    def grad_ov(g):
+        if sv.ndim == 1:
+            return np.outer(sv, g).reshape(s1)
+        return (np.atleast_2d(sv).T @ np.atleast_2d(g)).reshape(s1)
+
+    return BearTensor(f"({self.name}@{other.name})", result, [
+        BearParent(self,  BearGrad(grad_sv)),
+        BearParent(other, BearGrad(grad_ov)),
+    ])
+
+def dot(self, other):
+    if self.value.ndim != 1 or other.value.ndim != 1:
+        raise ValueError("dot() only supports 1-D BearTensors.")
+    sv, ov = self.value, other.value
+    return BearTensor(f"dot({self.name},{other.name})", np.atleast_1d(np.dot(sv, ov)), [
+        BearParent(self,  BearGrad(lambda g: np.squeeze(g) * ov)),
+        BearParent(other, BearGrad(lambda g: np.squeeze(g) * sv)),
+    ])
+
+def sum(self):
+    sv = self.value
+    return BearTensor(f"sum({self.name})", np.atleast_1d(np.sum(sv)), [
+        BearParent(self, BearGrad(lambda g: np.squeeze(g) * np.ones_like(sv))),
+    ])
+
+def mean(self):
+    sv = self.value
+    n = sv.size
+    return BearTensor(f"mean({self.name})", np.atleast_1d(np.mean(sv)), [
+        BearParent(self, BearGrad(lambda g: np.squeeze(g) * np.ones_like(sv) / n)),
+    ])
+
+def relu(self):
+    sv = self.value
+    return BearTensor(f"relu({self.name})", np.maximum(0, sv), [
+        BearParent(self, BearGrad(lambda g: g * (sv > 0))),
+    ])
+
+def sigmoid(self):
+    sv = self.value
+    sig = 1.0 / (1.0 + np.exp(-sv))
+    return BearTensor(f"sigmoid({self.name})", sig, [
+        BearParent(self, BearGrad(lambda g: g * sig * (1 - sig))),
+    ])
+
+BearTensor.__add__    = __add__
+BearTensor.__sub__    = __sub__
+BearTensor.__mul__    = __mul__
+BearTensor.__pow__    = __pow__
+BearTensor.__matmul__ = __matmul__
+BearTensor.dot        = dot
+BearTensor.sum        = sum
+BearTensor.mean       = mean
+BearTensor.relu       = relu
+BearTensor.sigmoid    = sigmoid
+```
+
+---
+
+## Visualizing Computation Graphs
+
+**To make the computation graph tangible, I built a visualization utility** using the [Fletcher](https://typst.app/universe/package/fletcher) Typst package. After any forward pass, `draw_graph(root)` traverses the graph, assigns nodes to levels via BFS, applies a barycentric crossing-minimization heuristic to reduce edge crossings, then emits a Typst source file that compiles to a PDF.
+
+```{python}
+#| eval: false
+from utils import draw_graph
+
+a = BearTensor("a", np.array([2, 3]))
+b = BearTensor("b", np.array([1, 1]))
+c = a + b
+draw_graph(c, "demo_graph.typ")
+```
+
+The rendered graph for `c = a + b`:
+
+![Computation graph for `c = a + b`, rendered via the Typst/Fletcher backend.](demo_graph.png){fig-cap="Each node shows its symbolic name and tensor shape. Edges carry the gradient function label for that edge of the computation graph."}
+
+---
+
+## Backpropagation via Topological Sort
+
+**The backward pass works in two steps.** First, a topological sort of the computation graph determines a valid propagation order — every node must receive all incoming gradients before it can pass gradients onward. Second, we traverse the sorted list in reverse and accumulate adjoints via the chain rule.
+
+The sort uses an iterative DFS to avoid Python's call-stack limit on deep networks. A node is appended to the output list only *after* all its descendants have been processed, so reversing the list gives root-first order — exactly what backprop needs.
+
+```{python}
+def topological_sort(node):
+    visited = set()
+    sorted_nodes = []
+    stack = [(node, False)]
+    while stack:
+        n, processed = stack.pop()
+        if processed:
+            sorted_nodes.append(n)
+            continue
+        if n in visited:
+            continue
+        visited.add(n)
+        stack.append((n, True))
+        for p in n.parents:
+            if p.parent not in visited:
+                stack.append((p.parent, False))
+    return sorted_nodes
+
+def reset_children(self):
+    for node in topological_sort(self):
+        node.adjoint = 0.0
+
+def backward(self):
+    self.reset_children()
+    self.adjoint = 1.0
+    for node in reversed(topological_sort(self)):
+        for bp in node.parents:
+            bp.parent.adjoint += bp.grad.fn(node.adjoint)
+
+BearTensor.reset_children = reset_children
+BearTensor.backward = backward
+```
+
+::: {.callout-note}
+Setting the root node's adjoint to 1.0 before the loop is the base case of the chain rule: $\partial L / \partial L = 1$. Every other adjoint is then accumulated by repeatedly applying each edge's stored gradient function.
+:::
+
+---
+
+## Optimizers
+
+**With gradients computed, an optimizer updates the parameters.** All three share a base class that holds the parameter list and exposes `zero_grad()` to clear adjoints between training steps.
+
+### SGD
+
+The simplest update rule — subtract the gradient scaled by the learning rate. No memory of past gradients.
+
+```{python}
+class Optimizer:
+    def __init__(self, params: list, lr: float):
+        self.params = params
+        self.lr = lr
+
+    def zero_grad(self):
+        for p in self.params:
+            p.adjoint = np.zeros_like(p.value)
+
+    def step(self):
+        raise NotImplementedError
+
+class SGD(Optimizer):
+    def step(self):
+        for p in self.params:
+            p.value -= self.lr * p.adjoint
+```
+
+### Momentum
+
+**Momentum accumulates a velocity vector** that smooths out gradient noise. At each step the velocity decays by `beta` and is nudged in the gradient direction, allowing the optimizer to accelerate through consistent gradient directions and dampen oscillations across inconsistent ones.
+
+```{python}
+class Momentum(Optimizer):
+    def __init__(self, params, lr, beta=0.9):
+        super().__init__(params, lr)
+        self.beta = beta
+        self.velocities = [np.zeros_like(p.value) for p in self.params]
+
+    def step(self):
+        for i, p in enumerate(self.params):
+            self.velocities[i] = self.beta * self.velocities[i] - self.lr * p.adjoint
+            p.value += self.velocities[i]
+```
+
+### Adam
+
+**Adam maintains per-parameter adaptive learning rates** by tracking both the first moment (mean of past gradients) and the second moment (uncentered variance). Bias correction in early steps prevents the moment estimates from being pulled toward zero before they have had time to warm up.
+
+```{python}
+class Adam(Optimizer):
+    def __init__(self, params, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        super().__init__(params, lr)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.t = 0
+        self.ms = [np.zeros_like(p.value) for p in self.params]
+        self.vs = [np.zeros_like(p.value) for p in self.params]
+
+    def step(self):
+        self.t += 1
+        for i, p in enumerate(self.params):
+            self.ms[i] = self.beta1 * self.ms[i] + (1 - self.beta1) * p.adjoint
+            self.vs[i] = self.beta2 * self.vs[i] + (1 - self.beta2) * p.adjoint ** 2
+            m_hat = self.ms[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.vs[i] / (1 - self.beta2 ** self.t)
+            p.value -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+```
+
+---
+
+## Optimizer Convergence Comparison
+
+**To compare the optimizers empirically**, I trained a 3-layer network (24→12→12→1 with sigmoid activations) on 1,000 random samples for 100 steps, starting from identical initial weights for each optimizer.
+
+```{python}
+#| fig-cap: "All three optimizers converge, but at different rates. Adam reaches the lowest loss in the fewest steps despite using a smaller learning rate, thanks to its adaptive per-parameter scaling."
+
+def compare_optimizers(optimizers, n_steps=100):
+    np.random.seed(0)
+    X = BearTensor("X", np.random.randn(1000, 24))
+    y = BearTensor("y", np.random.randn(1000, 1))
+
+    W1_init = np.random.randn(24, 12)
+    W2_init = np.random.randn(12, 12)
+    W3_init = np.random.randn(12, 1)
+
+    results = {}
+    for opt_class, title, lr in optimizers:
+        W1 = BearTensor("W1", deepcopy(W1_init))
+        W2 = BearTensor("W2", deepcopy(W2_init))
+        W3 = BearTensor("W3", deepcopy(W3_init))
+        optimizer = opt_class([W1, W2, W3], lr=lr)
+        losses = []
+        for _ in range(n_steps):
+            optimizer.zero_grad()
+            h1 = (X @ W1).sigmoid()
+            h2 = (h1 @ W2).sigmoid()
+            output = h2 @ W3
+            loss = ((output - y) ** 2).mean()
+            loss.backward()
+            losses.append(loss.value.item())
+            optimizer.step()
+        results[title] = losses
+    return results
+
+results = compare_optimizers([
+    (SGD,      "SGD",      0.05),
+    (Momentum, "Momentum", 0.05),
+    (Adam,     "Adam",     0.005),
+])
+
+plt.figure(figsize=(8, 5))
+for title, losses in results.items():
+    plt.plot(losses, label=title, linewidth=2)
+plt.xlabel("Step")
+plt.ylabel("MSE Loss")
+plt.title("Optimizer Convergence (Identical Initialization)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+Adam converges fastest, reaching a lower loss in fewer steps despite using a 10× smaller learning rate than SGD and Momentum. Momentum improves meaningfully over vanilla SGD but still lags behind Adam's adaptive per-parameter scaling.
+:::
+
+---
+
+## Training on Wine Quality
+
+**To validate the engine end-to-end**, I used it to train a two-layer MLP on the [Wine Quality dataset](https://archive.ics.uci.edu/dataset/186/wine+quality) — 1,599 red wine samples, each described by 11 physicochemical features (acidity, sulfates, alcohol content, etc.), with the task of predicting a quality score on a 0–10 scale.
+
+The architecture is a single hidden layer of 16 units with sigmoid activations, followed by a linear output node. I trained with Adam for 200 epochs, with standard scaling applied to the input features beforehand.
+
+```{python}
+from sklearn.datasets import fetch_openml
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+data = fetch_openml("wine-quality-red", as_frame=True)
+X_raw = data.data.to_numpy()
+y_raw = data.target.to_numpy().astype(float)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y_raw, test_size=0.4, random_state=42, shuffle=True
+)
+
+X_tensor = BearTensor("X_train", X_train)
+y_tensor = BearTensor("y_train", y_train.reshape(-1, 1))
+
+np.random.seed(42)
+W1 = BearTensor("W1", np.random.randn(11, 16) * 0.1)
+W2 = BearTensor("W2", np.random.randn(16, 1) * 0.1)
+
+optimizer = Adam([W1, W2], lr=0.01)
+train_losses = []
+
+for epoch in range(200):
+    optimizer.zero_grad()
+    h = (X_tensor @ W1).sigmoid()
+    output = h @ W2
+    loss = ((output - y_tensor) ** 2).mean()
+    loss.backward()
+    optimizer.step()
+    train_losses.append(loss.value.item())
+```
+
+```{python}
+#| fig-cap: "Training loss decreases smoothly and consistently across all 200 epochs, confirming the correctness of the autodiff engine, optimizer, and training loop."
+
+plt.figure(figsize=(8, 4))
+plt.plot(train_losses, linewidth=2, color='steelblue')
+plt.xlabel("Epoch")
+plt.ylabel("MSE Loss")
+plt.title("Wine Quality — Training Loss")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+def predict(x: np.ndarray) -> float:
+    """Return a quality score prediction for a single scaled feature vector."""
+    x_t = BearTensor("x", x.reshape(1, -1))
+    h = (x_t @ W1).sigmoid()
+    return (h @ W2).value.item()
+
+X_test_t = BearTensor("X_test", X_test)
+h_test = (X_test_t @ W1).sigmoid()
+out_test = h_test @ W2
+test_mse = np.mean((out_test.value.flatten() - y_test) ** 2)
+
+print(f"Final training MSE : {train_losses[-1]:.4f}")
+print(f"Test MSE           : {test_mse:.4f}")
+```
+
+::: {.callout-important}
+Loss decreased smoothly across all 200 epochs, and the test MSE is well below 2.0. This confirms that the full pipeline — dynamic graph construction, topological-sort backprop, Adam optimizer, and training loop — works correctly, built entirely on NumPy with no ML framework.
+:::
+
+---
+
+## The Muon Optimizer
+
+**Muon is a gradient optimizer that replaces raw momentum with an *orthogonalized* update**, motivated by a subtle flaw in standard momentum. A gradient matrix $G = U\Sigma V^\top$ has a singular value decomposition where a few large singular values can dominate the update, leaving directions with small singular values largely ignored. Standard momentum preserves this imbalance.
+
+Muon corrects this by approximating $UV^\top$ — the same singular vectors, but with all singular values set to 1, so every gradient direction gets an equal-weight update. This approach attracted attention by beating AdamW in the [NanoGPT speedrun benchmark](https://kellerjordan.github.io/posts/muon/).
+
+**Computing the exact SVD at every step is prohibitively expensive**, so Muon uses Newton-Schulz iteration instead — a fast polynomial approximation that drives all singular values toward 1. Starting from $X_0 = G / \|G\|_F$, each iteration applies:
+
+$$X \leftarrow 1.5\,X - 0.5\,(XX^\top)\,X$$
+
+After a few steps this converges to a close approximation of $UV^\top$. The result is then rescaled by $\sqrt{\text{fan\_out}/\text{fan\_in}}$ to keep update magnitudes consistent across layers of different shapes.
+
+```{python}
+class Muon(Optimizer):
+    def __init__(self, params, lr, momentum=0.95, eps=1e-7, ns_steps=5):
+        super().__init__(params, lr)
+        self.momentum = momentum
+        self.eps = eps
+        self.ns_steps = ns_steps
+        self.buffers = [np.zeros_like(p.value, dtype=float) for p in self.params]
+
+    def newton_schulz(self, G: np.ndarray) -> np.ndarray:
+        """Approximate UV^T of G via Newton-Schulz iteration."""
+        X = G.astype(float, copy=True)
+        X /= (np.linalg.norm(X, 'fro') + self.eps)
+        for _ in range(self.ns_steps):
+            X = 1.5 * X - 0.5 * (X @ X.T) @ X
+        return X
+
+    def step(self):
+        for i, p in enumerate(self.params):
+            self.buffers[i] = self.momentum * self.buffers[i] + p.adjoint
+            fan_out, fan_in = p.value.shape[0], p.value.shape[1]
+            O = np.sqrt(fan_out / fan_in) * self.newton_schulz(self.buffers[i])
+            p.value -= self.lr * O
+```
+
+**Comparing all four optimizers on the same convergence task:**
+
+```{python}
+#| fig-cap: "All four optimizers are compared from identical starting weights. Muon's orthogonalized updates are most impactful at scale; on this small synthetic task, Adam remains competitive."
+
+results_muon = compare_optimizers([
+    (SGD,      "SGD",      0.05),
+    (Momentum, "Momentum", 0.05),
+    (Adam,     "Adam",     0.005),
+    (Muon,     "Muon",     0.02),
+])
+
+plt.figure(figsize=(8, 5))
+for title, losses in results_muon.items():
+    plt.plot(losses, label=title, linewidth=2)
+plt.xlabel("Step")
+plt.ylabel("MSE Loss")
+plt.title("Optimizer Convergence — Including Muon (Identical Initialization)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+Muon's advantage over AdamW becomes most pronounced on large language model training with large batch sizes — the setting where the NanoGPT speedrun is measured. On this small synthetic regression task, where gradient noise is low and the network is shallow, Adam's adaptive learning rates remain highly competitive.
+:::

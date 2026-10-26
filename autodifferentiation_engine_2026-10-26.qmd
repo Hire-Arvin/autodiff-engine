@@ -450,12 +450,17 @@ h_test = (X_test_t @ W1).sigmoid()
 out_test = h_test @ W2
 test_mse = np.mean((out_test.value.flatten() - y_test) ** 2)
 
+# Baseline: always predict the mean training-set quality score
+baseline_mse = np.mean((y_train.mean() - y_test) ** 2)
+
 print(f"Final training MSE : {train_losses[-1]:.4f}")
 print(f"Test MSE           : {test_mse:.4f}")
+print(f"Mean-baseline MSE  : {baseline_mse:.4f}")
+print(f"Reduction vs. mean : {1 - test_mse / baseline_mse:.1%}")
 ```
 
 ::: {.callout-important}
-Loss decreased smoothly across all 200 epochs, and the test MSE is well below 2.0. This confirms that the full pipeline — dynamic graph construction, topological-sort backprop, Adam optimizer, and training loop — works correctly, built entirely on NumPy with no ML framework.
+Loss decreased smoothly across all 200 epochs. The network reaches a test MSE of 0.41, compared with 0.65 for a baseline that always predicts the mean training-set quality score, a 37% reduction. This confirms that the full pipeline — dynamic graph construction, topological-sort backprop, Adam optimizer, and training loop — works correctly, built entirely on NumPy with no ML framework.
 :::
 
 ---

@@ -45,3 +45,8 @@ data/*.db
 *.pdf
 tests/
 .jupyter_cache/
+
+# Superseded report versions — publish only the current dated copy (rendered to autodifferentiation_engine.html)
+autodifferentiation_engine.qmd
+autodifferentiation_engine_2026-10-26.html
+autodifferentiation_engine_2026-06-07.html
